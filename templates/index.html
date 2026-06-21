@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>YTdvy</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Archivo:wght@500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<div class="grain"></div>
+
+<main class="shell">
+
+  <header class="masthead">
+    <div class="masthead-mark">
+      <span class="mark-bracket">[</span><span class="mark-text">YTdvy</span><span class="mark-bracket">]</span>
+    </div>
+    <p class="masthead-sub">paste a link &middot; pull the signal &middot; keep the file</p>
+  </header>
+
+  <section class="deck" id="deck">
+
+    <div class="deck-row input-row">
+      <label class="deck-label" for="url-input">SRC</label>
+      <input
+        id="url-input"
+        class="deck-input"
+        type="text"
+        placeholder="youtube.com/watch?v=... or youtube.com/playlist?list=..."
+        autocomplete="off"
+        spellcheck="false"
+      />
+      <span class="detect-tag" id="detect-tag">—</span>
+    </div>
+
+    <div class="deck-row option-row">
+      <label class="deck-label">FMT</label>
+      <div class="quality-pills" id="quality-pills">
+        <button class="pill active" data-quality="best">BEST</button>
+        <button class="pill" data-quality="1080p">1080p</button>
+        <button class="pill" data-quality="720p">720p</button>
+        <button class="pill" data-quality="480p">480p</button>
+        <button class="pill" data-quality="audio">AUDIO</button>
+      </div>
+    </div>
+
+    <div class="deck-row action-row">
+      <button class="pull-btn" id="pull-btn">
+        <span class="pull-btn-text">PULL</span>
+        <span class="pull-btn-arrow">&rarr;</span>
+      </button>
+    </div>
+
+    <div class="deck-row note-row" id="note-row">
+      <span class="note-text">if it's a playlist, every clip downloads, then gets spliced into one file, in order.</span>
+    </div>
+
+  </section>
+
+  <section class="job-panel" id="job-panel" hidden>
+    <div class="job-header">
+      <span class="job-id" id="job-id-label">JOB —</span>
+      <span class="job-state" id="job-state">queued</span>
+    </div>
+
+    <div class="job-meter">
+      <div class="job-meter-fill" id="job-meter-fill"></div>
+      <div class="job-meter-ticks"></div>
+    </div>
+
+    <div class="job-message" id="job-message">Queued...</div>
+
+    <div class="job-counts" id="job-counts" hidden>
+      <span id="job-count-text">0 / 0 clips</span>
+    </div>
+
+    <div class="job-result" id="job-result" hidden>
+      <a class="download-link" id="download-link" href="#">
+        <span class="dl-icon">&#8595;</span>
+        <span id="download-filename">download.mp4</span>
+      </a>
+      <button class="reset-btn" id="reset-btn">pull another</button>
+    </div>
+
+    <div class="job-error" id="job-error" hidden></div>
+  </section>
+
+  <footer class="footnote">
+    <p>local-only &middot; runs on your machine &middot; uses yt-dlp + ffmpeg under the hood</p>
+  </footer>
+
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
