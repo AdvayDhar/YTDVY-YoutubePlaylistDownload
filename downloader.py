@@ -41,7 +41,7 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 #   yt-dlp --cookies-from-browser chrome --cookies cookies.txt https://www.youtube.com
 # Re-run tester.py after any change to confirm what's actually working
 # before assuming cookies are the fix.
-COOKIES_FILE_PATH = None            # e.g. "cookies.txt"
+COOKIES_FILE_PATH = cookies.txt            # e.g. "cookies.txt"
 COOKIES_FROM_BROWSER = None         # unreliable if browser is open; avoid
 
 # Player client(s) to identify as. "android" confirmed working via

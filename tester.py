@@ -11,6 +11,7 @@ Usage:
     python3 tester.py --video-id dQw4w9WgXcQ
     python3 tester.py --player-clients android,web
     python3 tester.py --num-requests 24
+    python3 tester.py --playlist-url "https://www.youtube.com/playlist?list=YOUR_REAL_PLAYLIST_ID"
 
 It runs a series of independent checks and tells you, in plain terms,
 which one(s) failed — so we stop guessing and know exactly where the
@@ -18,6 +19,7 @@ problem is.
 """
 import argparse
 import os
+import random
 import sys
 import time
 
@@ -271,6 +273,86 @@ def check_playlist_scale(cookies_path, player_clients, num_requests=8):
     return results
 
 
+def check_real_playlist(cookies_path, player_clients, playlist_url):
+    """Tests the EXACT code path run_job() uses for playlists: a single
+    extract_flat=True call against a real playlist URL, followed by
+    downloading each resulting entry — not synthetic individual watch URLs.
+
+    This is the one path tester.py never actually exercised before, and it's
+    the one place where the real app's behavior could differ from every
+    other check that passed.
+    """
+    banner("CHECK 9: REAL playlist extract_flat + per-entry download (exact app code path)")
+    if not playlist_url:
+        print("No --playlist-url given. Skipping. Pass one with --playlist-url <url>\n"
+              "to run this check (use the actual playlist that's failing in the app).")
+        return None
+
+    print(
+        f"Playlist URL: {playlist_url}\n"
+        "Step 1: running the exact extract_flat call run_job() uses.\n"
+        "Step 2: downloading each resulting entry one by one, exactly as the\n"
+        "app's playlist loop does (including the same sleep delay between videos)."
+    )
+
+    base_auth = {}
+    if cookies_path and os.path.exists(cookies_path):
+        base_auth["cookiefile"] = cookies_path
+
+    flat_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "extract_flat": True,
+        "extractor_args": {"youtube": {"player_client": player_clients}},
+        **base_auth,
+    }
+
+    print("\n--- Step 1: extract_flat metadata fetch ---")
+    try:
+        with yt_dlp.YoutubeDL(flat_opts) as ydl:
+            info = ydl.extract_info(playlist_url, download=False)
+        entries = [e for e in info.get("entries", []) if e]
+        print(f"OK: found {len(entries)} entries in playlist '{info.get('title', '?')}'")
+    except Exception as e:
+        print(f"FAIL at extract_flat stage: {e}")
+        return {"flat_fetch": False, "downloads": []}
+
+    print(f"\n--- Step 2: downloading each of {len(entries)} entries (format=worst, for speed) ---")
+    download_results = []
+    for idx, entry in enumerate(entries, start=1):
+        video_id = entry.get("id")
+        video_url = entry.get("url") or f"https://www.youtube.com/watch?v={video_id}"
+        opts = {
+            **base_auth,
+            "format": "worst",
+            "outtmpl": os.path.join("tester_output", "playlist_%(id)s.%(ext)s"),
+            "extractor_args": {"youtube": {"player_client": player_clients}},
+            "quiet": True,
+            "no_warnings": True,
+        }
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.download([video_url])
+            print(f"  [{idx}/{len(entries)}] OK ({video_id})")
+            download_results.append(True)
+        except Exception as e:
+            print(f"  [{idx}/{len(entries)}] FAIL ({video_id}): {e}")
+            download_results.append(False)
+        if idx < len(entries):
+            time.sleep(random.uniform(2, 5))
+
+    first_fail = next((i for i, ok in enumerate(download_results) if not ok), None)
+    if first_fail is not None:
+        print(
+            f"\nFirst failure at entry #{first_fail + 1} of {len(entries)} in the REAL "
+            "playlist.\nThis is the exact pattern the app hits."
+        )
+    else:
+        print(f"\nAll {len(entries)} entries downloaded successfully.")
+
+    return {"flat_fetch": True, "entry_count": len(entries), "downloads": download_results}
+
+
 def main():
     parser = argparse.ArgumentParser(description="Diagnose yt-dlp / YouTube access issues.")
     parser.add_argument("--cookies", default="cookies.txt",
@@ -287,6 +369,11 @@ def main():
                          help="Number of back-to-back requests for the playlist-scale check "
                               "(default: 8). Use a higher number (e.g. 24) to fully reproduce "
                               "a large playlist run.")
+    parser.add_argument("--playlist-url", default=None,
+                         help="The ACTUAL playlist URL that's failing in your app. If given, "
+                              "runs CHECK 9 which replicates the app's exact code path "
+                              "(extract_flat + per-entry download) against this real playlist, "
+                              "instead of synthetic single-video tests.")
     args = parser.parse_args()
     player_clients = [c.strip() for c in args.player_clients.split(",") if c.strip()]
 
@@ -309,6 +396,7 @@ def main():
 
     app_format_results = check_app_format_strings(args.cookies, chosen_video, player_clients)
     playlist_scale_results = check_playlist_scale(args.cookies, player_clients, args.num_requests)
+    real_playlist_result = check_real_playlist(args.cookies, player_clients, args.playlist_url)
 
     # --- Summary -----------------------------------------------------
     banner("SUMMARY")
@@ -326,6 +414,13 @@ def main():
         print(f"    {quality:6s} -> {ok}")
     num_ok = sum(playlist_scale_results)
     print(f"\nPlaylist-scale burst ({args.num_requests} requests): {num_ok}/{args.num_requests} succeeded")
+    if real_playlist_result is not None:
+        if real_playlist_result.get("flat_fetch"):
+            n = real_playlist_result["entry_count"]
+            ok_count = sum(real_playlist_result["downloads"])
+            print(f"\nREAL playlist test: extract_flat OK, {ok_count}/{n} entries downloaded")
+        else:
+            print("\nREAL playlist test: extract_flat FAILED before any downloads were attempted")
 
     print("\n" + DIVIDER)
     print("INTERPRETATION")
@@ -336,7 +431,49 @@ def main():
     burst_all_ok = all(playlist_scale_results)
     burst_first_fail = next((i for i, ok in enumerate(playlist_scale_results) if not ok), None)
 
-    if not app_format_any_ok:
+    real_playlist_all_ok = None
+    real_playlist_first_fail = None
+    if real_playlist_result is not None and real_playlist_result.get("flat_fetch"):
+        downloads = real_playlist_result["downloads"]
+        real_playlist_all_ok = all(downloads) if downloads else None
+        real_playlist_first_fail = next((i for i, ok in enumerate(downloads) if not ok), None)
+
+    if real_playlist_result is not None and not real_playlist_result.get("flat_fetch"):
+        print(
+            "- The REAL playlist's extract_flat call itself failed, before any per-video\n"
+            "  download was even attempted. This is a different failure point than\n"
+            "  anything else tested — check the Step 1 error above. This may mean the\n"
+            "  playlist itself has an issue (private, region-locked, deleted) "
+            "independent\n"
+            "  of bot-detection entirely."
+        )
+    elif real_playlist_all_ok is False:
+        print(
+            f"- THE REAL PLAYLIST FAILS even though every synthetic test passed. First\n"
+            f"  failure at entry #{real_playlist_first_fail + 1} of "
+            f"{real_playlist_result['entry_count']}.\n"
+            "  This confirms the issue is specific to THIS playlist/these videos, not\n"
+            "  a general yt-dlp/IP/auth problem (which all passed). Likely causes:\n"
+            "  the specific videos in this playlist may have per-video restrictions\n"
+            "  (age-gated, region-locked, or owner-restricted) that trigger bot-checks\n"
+            "  even when other public videos don't. Check which entries failed above —\n"
+            "  if it's consistently the SAME videos failing every run, those specific\n"
+            "  videos likely need cookies (real authentication) regardless of player\n"
+            "  client, while the rest of your library doesn't."
+        )
+    elif real_playlist_all_ok is True:
+        print(
+            f"- The REAL playlist downloaded successfully end-to-end "
+            f"({real_playlist_result['entry_count']} entries,\n"
+            "  all OK) using the app's exact code path. If the actual app still fails\n"
+            "  on this same playlist, the difference must be in something tester.py\n"
+            "  does NOT replicate — e.g. the app's real format strings (best/720p/etc)\n"
+            "  combined with THIS playlist's videos specifically (re-run CHECK 9-style\n"
+            "  logic with real format strings instead of 'worst' if this happens), or\n"
+            "  a difference in environment between when you ran tester.py and when you\n"
+            "  ran the app (time elapsed, IP changed, etc)."
+        )
+    elif not app_format_any_ok:
         print(
             f"- NONE of the app's actual format strings work with player_client="
             f"{player_clients}, even though CHECK 5/6's simpler tests passed. This means\n"
@@ -376,13 +513,10 @@ def main():
             f"{args.num_requests}-request\n"
             "  burst. This setup should now work for actual playlists. If a real "
             "playlist\n"
-            "  run still fails, the difference is likely either playlist length "
-            "(re-run\n"
-            "  with --num-requests 24+ to match), or something playlist-specific "
-            "(e.g. the\n"
-            "  extract_flat metadata call in run_job is not using player_client at "
-            "all —\n"
-            "  worth checking downloader.py for that)."
+            "  run still fails, the difference is likely playlist length or "
+            "something\n"
+            "  specific to that playlist — pass --playlist-url with the real failing\n"
+            "  playlist to test that directly (CHECK 9)."
         )
     elif cookie_status is False:
         print(
