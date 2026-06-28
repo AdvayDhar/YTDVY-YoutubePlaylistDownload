@@ -30,21 +30,23 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 
 # --- Bot-check / auth config -------------------------------------------
 #
-# YouTube increasingly challenges automated clients ("Sign in to confirm
-# you're not a bot"). The most reliable fix is sending cookies from a real,
-# logged-in browser session on this machine, which is what these settings
-# control.
+# Diagnosed via tester.py: this setup does NOT currently need cookies at
+# all. Bare/no-auth requests work fine, and the "android" player client
+# specifically works, while "web" (which was previously forced on
+# alongside "android") returns restricted format lists and causes
+# failures. So: no cookies, pin to "android" only.
 #
-# Set COOKIES_FROM_BROWSER to the browser you're logged into YouTube with:
-#   "chrome", "firefox", "edge", "brave", "vivaldi", "opera", "safari"
-# Leave as None to disable (you'll be more likely to hit bot checks).
-#
-# Alternatively, set COOKIES_FILE_PATH to a cookies.txt file exported via
-# a browser extension (e.g. "Get cookies.txt LOCALLY") if --cookies-from-browser
-# doesn't work for your setup (e.g. browser keychain access issues on some
-# OSes/containers).
-COOKIES_FROM_BROWSER = "chrome"   # or "firefox", "edge", "brave", etc. / None
-COOKIES_FILE_PATH = None          # e.g. "/home/you/cookies.txt"
+# If bot-checks start happening later (YouTube changes things often),
+# set COOKIES_FILE_PATH below to a cookies.txt file. Generate one with:
+#   yt-dlp --cookies-from-browser chrome --cookies cookies.txt https://www.youtube.com
+# Re-run tester.py after any change to confirm what's actually working
+# before assuming cookies are the fix.
+COOKIES_FILE_PATH = None            # e.g. "cookies.txt"
+COOKIES_FROM_BROWSER = None         # unreliable if browser is open; avoid
+
+# Player client(s) to identify as. "android" confirmed working via
+# tester.py; "web" confirmed broken (restricted formats) on this setup.
+PLAYER_CLIENTS = ["android"]
 
 # Small randomized delay between video downloads in a playlist. Hammering
 # YouTube with rapid back-to-back requests is itself a bot-detection signal,
@@ -84,11 +86,26 @@ def _friendly_error(e: Exception) -> str:
     msg = str(e)
     lowered = msg.lower()
     if "sign in to confirm" in lowered and "bot" in lowered:
+        if COOKIES_FILE_PATH and not os.path.exists(COOKIES_FILE_PATH):
+            return (
+                f"YouTube's bot check blocked this download, and no cookies file was "
+                f"found at '{COOKIES_FILE_PATH}'. Run this once in your terminal from "
+                f"the project folder: yt-dlp --cookies-from-browser chrome --cookies "
+                f"cookies.txt https://www.youtube.com  (swap 'chrome' for your browser), "
+                f"then restart the app."
+            )
         return (
-            "YouTube's bot check blocked this download. Open downloader.py and set "
-            "COOKIES_FROM_BROWSER to the browser you're logged into YouTube with "
-            "(e.g. 'chrome' or 'firefox'), then make sure you're actually signed "
-            "into YouTube in that browser. Restart the app after changing it."
+            "YouTube's bot check blocked this download. Run tester.py to check which "
+            "player clients currently work, and update PLAYER_CLIENTS in downloader.py "
+            "accordingly. If cookies are configured, they may have expired — re-run: "
+            "yt-dlp --cookies-from-browser chrome --cookies cookies.txt "
+            "https://www.youtube.com to refresh."
+        )
+    if "requested format is not available" in lowered:
+        return (
+            "yt-dlp couldn't find a matching format for this video with the current "
+            "player client. Run tester.py to see which player clients currently return "
+            "full format lists, and update PLAYER_CLIENTS in downloader.py to match."
         )
     if "http error 429" in lowered or "too many requests" in lowered:
         return (
@@ -171,8 +188,7 @@ def _download_single(url: str, out_dir: str, quality: str, job: Job, index=None,
         "quiet": True,
         "no_warnings": True,
         "restrictfilenames": False,
-        # Identify as a real browser client to reduce bot-check hits
-        "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
+        "extractor_args": {"youtube": {"player_client": PLAYER_CLIENTS}},
         **_auth_opts(),
     }
     if quality == "audio":
@@ -273,7 +289,12 @@ def run_job(job: Job, raw_url: str):
             job.status = "fetching_info"
             job.message = "Reading playlist contents..."
 
-            with yt_dlp.YoutubeDL({"quiet": True, "extract_flat": True, **_auth_opts()}) as ydl:
+            with yt_dlp.YoutubeDL({
+                "quiet": True,
+                "extract_flat": True,
+                "extractor_args": {"youtube": {"player_client": PLAYER_CLIENTS}},
+                **_auth_opts(),
+            }) as ydl:
                 info = ydl.extract_info(norm["clean_url"], download=False)
 
             entries = [e for e in info.get("entries", []) if e]
@@ -297,7 +318,7 @@ def run_job(job: Job, raw_url: str):
                     downloaded_files.append(path)
                 except Exception as e:
                     # Skip videos that fail (deleted/private/region-locked) but keep going
-                    job.message = f"Skipped video {idx}/{job.total_items} (unavailable): {e}"
+                    job.message = f"Skipped video {idx}/{job.total_items} (unavailable): {_friendly_error(e)}"
                     continue
                 job.completed_items = idx
                 job.progress = int((idx / job.total_items) * 80)  # reserve last 20% for merge
