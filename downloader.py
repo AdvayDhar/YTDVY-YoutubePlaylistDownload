@@ -10,9 +10,11 @@ Designed to run jobs in a background thread and report progress via a
 shared dict so the Flask app can poll status.
 """
 import os
+import random
 import re
 import shutil
 import subprocess
+import time
 import uuid
 
 import yt_dlp
@@ -25,6 +27,41 @@ TEMP_DIR = os.path.join(BASE_DIR, "temp")
 
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 os.makedirs(TEMP_DIR, exist_ok=True)
+
+# --- Bot-check / auth config -------------------------------------------
+#
+# YouTube increasingly challenges automated clients ("Sign in to confirm
+# you're not a bot"). The most reliable fix is sending cookies from a real,
+# logged-in browser session on this machine, which is what these settings
+# control.
+#
+# Set COOKIES_FROM_BROWSER to the browser you're logged into YouTube with:
+#   "chrome", "firefox", "edge", "brave", "vivaldi", "opera", "safari"
+# Leave as None to disable (you'll be more likely to hit bot checks).
+#
+# Alternatively, set COOKIES_FILE_PATH to a cookies.txt file exported via
+# a browser extension (e.g. "Get cookies.txt LOCALLY") if --cookies-from-browser
+# doesn't work for your setup (e.g. browser keychain access issues on some
+# OSes/containers).
+COOKIES_FROM_BROWSER = "chrome"   # or "firefox", "edge", "brave", etc. / None
+COOKIES_FILE_PATH = None          # e.g. "/home/you/cookies.txt"
+
+# Small randomized delay between video downloads in a playlist. Hammering
+# YouTube with rapid back-to-back requests is itself a bot-detection signal,
+# so spacing requests out a bit makes the traffic look more human.
+MIN_SLEEP_BETWEEN_DOWNLOADS = 2     # seconds
+MAX_SLEEP_BETWEEN_DOWNLOADS = 5     # seconds
+
+
+def _auth_opts() -> dict:
+    """Returns the cookie-auth portion of yt-dlp options, if configured."""
+    opts = {}
+    if COOKIES_FILE_PATH:
+        opts["cookiefile"] = COOKIES_FILE_PATH
+    elif COOKIES_FROM_BROWSER:
+        # yt-dlp expects a tuple: (browser, profile, keyring, container)
+        opts["cookiesfrombrowser"] = (COOKIES_FROM_BROWSER, None, None, None)
+    return opts
 
 # Quality format strings yt-dlp understands
 QUALITY_FORMATS = {
@@ -40,6 +77,27 @@ def _safe_filename(name: str) -> str:
     """Strip characters that are awkward in filenames across OSes."""
     name = re.sub(r'[\\/*?:"<>|]', "_", name)
     return name.strip()[:150] or "output"
+
+
+def _friendly_error(e: Exception) -> str:
+    """Turns common yt-dlp errors into messages that actually tell you what to do."""
+    msg = str(e)
+    lowered = msg.lower()
+    if "sign in to confirm" in lowered and "bot" in lowered:
+        return (
+            "YouTube's bot check blocked this download. Open downloader.py and set "
+            "COOKIES_FROM_BROWSER to the browser you're logged into YouTube with "
+            "(e.g. 'chrome' or 'firefox'), then make sure you're actually signed "
+            "into YouTube in that browser. Restart the app after changing it."
+        )
+    if "http error 429" in lowered or "too many requests" in lowered:
+        return (
+            "YouTube is rate-limiting this IP (too many requests). Wait a while "
+            "before trying again, or lower the request rate."
+        )
+    if "private video" in lowered or "video unavailable" in lowered:
+        return "This video is private, deleted, or otherwise unavailable."
+    return msg
 
 
 class Job:
@@ -98,7 +156,11 @@ def _make_progress_hook(job: Job, item_label_prefix=""):
 
 
 def _download_single(url: str, out_dir: str, quality: str, job: Job, index=None, total=None) -> str:
-    """Downloads one video, returns the path to the resulting file."""
+    """Downloads one video, returns the path to the resulting file.
+
+    Retries once on failure after a short delay — some bot-check errors are
+    transient and clear up on a second attempt a few seconds later.
+    """
     label = f"[{index}/{total}] " if index and total else ""
     ydl_opts = {
         "format": QUALITY_FORMATS.get(quality, QUALITY_FORMATS["best"]),
@@ -109,6 +171,9 @@ def _download_single(url: str, out_dir: str, quality: str, job: Job, index=None,
         "quiet": True,
         "no_warnings": True,
         "restrictfilenames": False,
+        # Identify as a real browser client to reduce bot-check hits
+        "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
+        **_auth_opts(),
     }
     if quality == "audio":
         ydl_opts["postprocessors"] = [{
@@ -117,13 +182,22 @@ def _download_single(url: str, out_dir: str, quality: str, job: Job, index=None,
             "preferredquality": "192",
         }]
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        filename = ydl.prepare_filename(info)
-        if quality == "audio":
-            base, _ = os.path.splitext(filename)
-            filename = base + ".mp3"
-        return filename
+    last_error = None
+    for attempt in range(2):
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                filename = ydl.prepare_filename(info)
+                if quality == "audio":
+                    base, _ = os.path.splitext(filename)
+                    filename = base + ".mp3"
+                return filename
+        except Exception as e:
+            last_error = e
+            if attempt == 0:
+                job.message = f"{label}Hit an error, retrying in a few seconds..."
+                time.sleep(6)
+    raise last_error
 
 
 def _ffmpeg_concat(file_list, output_path, job: Job):
@@ -199,7 +273,7 @@ def run_job(job: Job, raw_url: str):
             job.status = "fetching_info"
             job.message = "Reading playlist contents..."
 
-            with yt_dlp.YoutubeDL({"quiet": True, "extract_flat": True}) as ydl:
+            with yt_dlp.YoutubeDL({"quiet": True, "extract_flat": True, **_auth_opts()}) as ydl:
                 info = ydl.extract_info(norm["clean_url"], download=False)
 
             entries = [e for e in info.get("entries", []) if e]
@@ -228,6 +302,10 @@ def run_job(job: Job, raw_url: str):
                 job.completed_items = idx
                 job.progress = int((idx / job.total_items) * 80)  # reserve last 20% for merge
 
+                # Space out requests a bit; rapid back-to-back hits look bot-like
+                if idx < job.total_items:
+                    time.sleep(random.uniform(MIN_SLEEP_BETWEEN_DOWNLOADS, MAX_SLEEP_BETWEEN_DOWNLOADS))
+
             if not downloaded_files:
                 job.status = "error"
                 job.error = "None of the videos in the playlist could be downloaded."
@@ -254,7 +332,7 @@ def run_job(job: Job, raw_url: str):
 
     except Exception as e:
         job.status = "error"
-        job.error = str(e)
+        job.error = _friendly_error(e)
     finally:
         # Clean up per-video temp files (keep only the final moved file)
         try:
